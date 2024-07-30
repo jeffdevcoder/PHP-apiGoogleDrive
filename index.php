@@ -1,17 +1,22 @@
 <?php
 
+ini_set('memory_limit', '2048M');
+ini_set('max_execution_time', '1800');
+
 require 'vendor/autoload.php';
 
 use Dotenv\Dotenv;
 use Google\Client as Google_Client;
 use Google\Service\Drive as Google_Service_Drive;
 use Google\Service\Drive\DriveFile as Google_Service_Drive_DriveFile;
+use GuzzleHttp\Client as GuzzleHttpClient;
 
 class GoogleDriveUpload 
 {
     private $filesPaths;
     private $filesNames;
     private $fileIds;
+    private $folderName;
 
     public function __construct($filesPaths, $filesNames, $folderName = 'UploadedFiles') 
     {
@@ -27,24 +32,50 @@ class GoogleDriveUpload
             throw new Exception('.env file not found');
         }
 
-        define('GOOGLE_CLIENT_ID', $_ENV['GOOGLE_CLIENT_ID']);
-        define('GOOGLE_CLIENT_SECRET', $_ENV['GOOGLE_CLIENT_SECRET']);
-        define('GOOGLE_REDIRECT_URI', $_ENV['GOOGLE_REDIRECT_URI']);
-        define('REFRESH_TOKEN', $_ENV['REFRESH_TOKEN']);
-
+        $this->googleClientId = $_ENV['GOOGLE_CLIENT_ID'];
+        $this->googleClientSecret = $_ENV['GOOGLE_CLIENT_SECRET'];
+        $this->googleRedirectUri = $_ENV['GOOGLE_REDIRECT_URI'];
+        $this->refreshToken = $_ENV['REFRESH_TOKEN'];
     }
 
     private function getClient() 
     {
         $client = new Google_Client();
-        $client->setClientId(GOOGLE_CLIENT_ID);
-        $client->setClientSecret(GOOGLE_CLIENT_SECRET);
-        $client->setRedirectUri(GOOGLE_REDIRECT_URI);
+        $client->setClientId($this->googleClientId);
+        $client->setClientSecret($this->googleClientSecret);
+        $client->setRedirectUri($this->googleRedirectUri);
         $client->addScope(Google_Service_Drive::DRIVE_FILE);
         $client->setAccessType('offline');
         $client->setPrompt('select_account consent');
-        $client->fetchAccessTokenWithRefreshToken(REFRESH_TOKEN);
+        $client->fetchAccessTokenWithRefreshToken($this->refreshToken);
         return $client;
+    }
+
+    private function addArchive($service, $folderId) 
+    {
+        $zipFileName = "{$this->folderName}.zip";
+        $zipFilePath = sys_get_temp_dir() . '/' . $zipFileName;
+        $zip = new ZipArchive();
+
+        if ($zip->open($zipFilePath, ZipArchive::CREATE | ZipArchive::OVERWRITE) === TRUE) {
+            foreach ($this->filesPaths as $key => $path) {
+                if (file_exists($path)) {
+                    $zip->addFile($path, $this->filesNames[$key]);
+                } else {
+                    throw new Exception("Arquivo não encontrado: $path");
+                }
+            }
+            $zip->close();
+        } else {
+            throw new Exception("Não foi possível criar o arquivo zip: $zipFilePath");
+        }
+
+        $fileId = $this->getFileIdByName($service, $zipFileName, $folderId);
+        $newFile = new Google_Service_Drive_DriveFile([
+            'name' => $zipFileName
+        ]);
+
+        $this->uploadFileInChunks($service, $newFile, $zipFilePath, $fileId, $folderId);
     }
 
     private function getFolderId($service)
@@ -84,53 +115,102 @@ class GoogleDriveUpload
         return null;
     }
 
+    private function uploadFileInChunks($service, $newFile, $zipFilePath, $fileId, $folderId)
+    {
+        $client = new GuzzleHttpClient(['timeout' => 1200]);
+        $fileSize = filesize($zipFilePath);
+        $chunkSize = 128 * 1024;
+        $handle = fopen($zipFilePath, 'rb');
+
+        if ($fileId) {
+            $url = "https://www.googleapis.com/upload/drive/v3/files/{$fileId}?uploadType=resumable";
+        } else {
+            $newFile->setParents([$folderId]);
+            $url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable";
+        }
+
+        $accessToken = $service->getClient()->getAccessToken()['access_token'];
+        $headers = [
+            'Authorization' => 'Bearer '. $accessToken,
+            'Content-Length' => $fileSize,
+            'Content-Type' => 'application/zip'
+        ];
+
+        $retryCount = 0;
+        $maxRetries = 3;
+        $backoff = 1;
+
+        while ($retryCount < $maxRetries) {
+            try {
+                $response = $client->post($url, [
+                    'headers' => $headers,
+                    'body' => ''
+                ]);
+
+                $uploadUrl = $response->getHeader('Location')[0];
+
+                $offset = 0;
+                while (!feof($handle)) {
+                    $chunk = fread($handle, $chunkSize);
+                    $contentRange = "bytes {$offset}-". ($offset + strlen($chunk) - 1). "/{$fileSize}";
+
+                    try {
+                        $client->put($uploadUrl, [
+                            'headers' => [
+                                'Authorization' => 'Bearer '. $accessToken,
+                                'Content-Length' => strlen($chunk),
+                                'Content-Range' => $contentRange,
+                            ],
+                            'body' => $chunk
+                        ]);
+
+                        if ($offset > 0 && $offset % (128 * 1024) == 0) {
+                            echo "Enviando...\n";
+                            flush();
+                        }
+                    } catch (GuzzleHttp\Exception\RequestException $e) {
+                        if ($e->getCode() == 408) {
+                            $retryCount++;
+                            sleep($backoff);
+                            $backoff *= 2;
+                            continue;
+                        } else {
+                            fclose($handle);
+                            throw $e;
+                        }
+                    }
+
+                    $offset += strlen($chunk);
+                }
+
+                fclose($handle);
+
+                $this->fileIds[] = $fileId;
+                return;
+            } catch (GuzzleHttp\Exception\RequestException $e) {
+                if ($e->getCode() == 408) {
+                    $retryCount++;
+                    sleep($backoff);
+                    $backoff *= 2;
+                    continue;
+                } else {
+                    fclose($handle); 
+                    throw $e;
+                }
+            }
+        }
+
+        fclose($handle);
+        echo "Erro de upload: ". $e->getMessage(). "\n";
+    }
+
     public function uploadFiles()
     {
         $client = $this->getClient();
         $service = new Google_Service_Drive($client);
         $folderId = $this->getFolderId($service);
 
-        for ($index = 0; $index < count($this->filesPaths); $index++) {
-            $fileName = $this->filesNames[$index];
-            $filePath = $this->filesPaths[$index];
-            $fileId = $this->getFileIdByName($service, $fileName, $folderId);
-
-            $newFile = new Google_Service_Drive_DriveFile([
-                'name' => $fileName
-            ]);
-
-            if (file_exists($filePath)) {
-                $data = file_get_contents($filePath);
-
-                if ($fileId) {
-                    $updatedFile = $service->files->update($fileId, $newFile, [
-                        'data' => $data,
-                        'mimeType' => 'application/octet-stream',
-                        'uploadType' => 'multipart'
-                    ]);
-
-                    $parentUpdate = new Google_Service_Drive_DriveFile();
-                    $service->files->update($fileId, $parentUpdate, [
-                        'addParents' => $folderId,
-                        'fields' => 'id, parents'
-                    ]);
-
-                    $this->fileIds[] = $updatedFile->getId();
-                    break;
-                } else {
-                    $newFile->setParents([$folderId]);
-                    $createdFile = $service->files->create($newFile, [
-                        'data' => $data,
-                        'mimeType' => 'application/octet-stream',
-                        'uploadType' => 'multipart'
-                    ]);
-                    $this->fileIds[] = $createdFile->getId();
-                    break;
-                }
-            } else {
-            throw new Exception("Arquivo não encontrado: $filePath");
-            }
-        }
+        $this->addArchive($service, $folderId);
 
         $this->printIds();
     }
@@ -145,11 +225,15 @@ class GoogleDriveUpload
 }
 
 $filesPaths = [
-    'arquivos/teste.zip'
+    './arquivos/serenidade.sql',
+    './arquivos/eternidadeliesse.sql',
+    './arquivos/eternidade.sql'
 ];
 
 $filesNames = [
-    'teste.zip'
+    'serenidade.sql',
+    'eternidadeliesse.sql',
+    'eternidade.sql'
 ];
 
 $uploader = new GoogleDriveUpload($filesPaths, $filesNames);
